@@ -1,49 +1,100 @@
-# Automated Forward Merging and Notification System
+# Badger-badger-notifications
 
-## Overview
-We need a system to automate the tracking of changes across release branches, notify users who have submitted changes in these branches, and ensure that necessary changes are carried forward into subsequent branches, including the master branch. The system should determine the "happy path" for forward merging, either by chaining forward or merging directly to master, with a clear, documented opinion on the chosen strategy.
+Kotlin JVM implementation of the multi-channel notification platform described in [ARCHITECTURE.md](ARCHITECTURE.md): a **gateway** enqueues work to **Redis Streams**, **workers** hydrate templates, respect **user preferences / DND**, deliver over **Email / SMS / Push** (real providers when configured, console stubs otherwise), persist **audit rows** in **PostgreSQL**, support **scheduled sends**, **retries / DLQ / fallback channel**, **per-tenant rate limits**, and **Prometheus** metrics.
 
-## Context
-Release branches are created for each module consumed by the monolith, with the goal of producing stable, secure artifacts for each module that can be updated independently. These artifacts are included in the Bill Of Materials (BOM) associated with each quarterly release. The system must ensure that fixes applied to any release branch are automatically considered for integration into subsequent branches, including master. Users who submit changes should be notified of the status of their changes and any required forward merges.
+## Modules
 
-## Proposed Solution: Git Workflow Assumption
-This system will follow a similar workflow to the existing Perforce-based solution but will be adapted for a Git-based distributed version control system (VCS).
+| Module | Role |
+|--------|------|
+| `shared` | Domain types and API DTOs (`Channel`, `NotifyRequest`, `OutboundDeliveryJob`, …). |
+| `broker-api` | Broker port types (`BrokerPublisher`, `BrokerConsumer`, `NotificationStream`). |
+| `broker-redis` | Redis Streams implementation. |
+| `persistence` | Flyway migrations + JDBC repositories (events, templates, preferences, scheduled jobs). |
+| `channels` | `ChannelSender` implementations (console, SMTP, Twilio, optional FCM HTTP v1). |
+| `gateway` | Ktor HTTP API (`/v1/...`), API key auth, rate limit, `/metrics`. |
+| `worker` | Stream consumer, delivery pipeline, scheduler tick, `/metrics` on port 9404. |
 
-### Workflow
-Identify Git Projects with Release Branches:
+## Prerequisites
 
-* Collect and maintain a list of Git projects that have release branches. This can be done using a configuration file or by querying the Git repository.
-Isolate Release Branches for Specific Projects:
+- JDK 17+
+- PostgreSQL 16+ and Redis 7+ (or use Docker Compose below)
 
-* For each project, identify the relevant release branches. This will typically involve querying the branch structure and filtering based on naming conventions or tags.
-Get Commits Prior to the Previous Branch Cut:
+## Local run (Gradle)
 
-* For each release branch, retrieve the list of commits that were made after the last branch cut (e.g., from the point of the last release).
-### Filter Out Integrated Changes:
+Terminal 1 — Postgres & Redis (or point `JDBC_URL` / `REDIS_URL` at your own instances):
 
-* Use `git cherry -v $sourceBranch $destBranch` to compare the source branch with the destination branch and filter out changes that have already been integrated.
-### Filter Out Excluded Changes:
+```bash
+docker compose up -d postgres redis
+```
 
-Exclude changes marked for null-integration or those that have already been merged. This can be done using Git notes or parsing commit messages for specific tags (e.g., [null-integrate]).
-### Create Patch for Pending Merges:
+Apply migrations and start processes:
 
-For each change that has not been integrated or excluded, create a patch or a set of pending changes that need to be merged into the destination branch.
-### Email Patches to Users:
+```bash
+export JDBC_URL=jdbc:postgresql://localhost:5432/badger
+export JDBC_USER=badger
+export JDBC_PASSWORD=badger
+export REDIS_URL=redis://localhost:6379
+export GATEWAY_API_KEY=dev-key
 
-Use git send-email to notify each user responsible for the changes, providing them with the necessary patches and instructions for applying them to the release branch.
-### Record Exclusion Information:
+./gradlew :gateway:run &
+./gradlew :worker:run &
+```
 
-Use Git notes to record any exclusion decisions, ensuring that these are carried forward and respected in future merge decisions.
-## Discussion
-### Git Hooks:
+Health: `curl -s http://localhost:8080/health`
 
-Git hooks can be used to automate the triggering of scripts for tasks such as checking for pending merges, generating patches, and sending emails.
-### Git Notes:
+## Docker Compose (full stack)
 
-Git notes are useful for recording metadata about commits, such as exclusion information, without altering the commits themselves.
-### Automated Emails:
+Builds gateway and worker images with the Gradle wrapper inside Docker, then runs Postgres, Redis, gateway, and worker.
 
-The git send-email tool can be configured to send automated notifications to users, reducing the manual overhead.
-### Chaining Forward vs. Merging to Master:
+```bash
+docker compose up --build
+```
 
-The system should decide on a clear "happy path" for merging. This could involve chaining fixes forward through all relevant branches or directly merging them to the master branch. Prototyping both approaches will help in making an informed decision.
+- Gateway: `http://localhost:8080` (metrics: `/metrics`)
+- Worker metrics: `http://localhost:9404/metrics`
+
+Default API key: `GATEWAY_API_KEY=dev-key` (set in compose for gateway).
+
+## API (selected)
+
+All `/v1/*` routes require header: `X-API-Key: <GATEWAY_API_KEY>`.
+
+- `POST /v1/notify` — body `NotifyRequest` (`tenantId`, `userId`, `templateId`, `channel`, `variables`, optional `idempotencyKey`, `fallbackChannel`, …). Optional header `X-Idempotency-Key`.
+- `GET /v1/events/{id}` — delivery row (debug).
+- `POST /v1/admin/templates` — create template + version 1.
+- `GET /v1/admin/templates?tenantId=` — list.
+- `GET /v1/admin/templates/{id}?tenantId=` — fetch.
+- `POST /v1/admin/templates/{id}/versions` — new version (optional A/B `variantTag` on create/version requests via template tables).
+- `POST /v1/preferences` — opt-in flags + DND window (`dndStart` / `dndEnd` as `HH:mm`, `timezone` IANA id).
+- `POST /v1/schedule` — `ScheduleNotifyRequest` with `runAtIso` (instant ISO-8601).
+
+## Provider environment variables
+
+| Channel | When active | Variables |
+|---------|----------------|------------|
+| Email | `SMTP_HOST` set | `variables.to`, `variables.subject` |
+| SMS | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` | `variables.to` (E.164) |
+| Push | `FCM_PROJECT_ID` + `FCM_ACCESS_TOKEN` (short-lived OAuth bearer) | `variables.deviceToken` or `variables.to` |
+
+If not configured, channels log to stdout (console stub).
+
+## Roadmap vs ARCHITECTURE.md
+
+| ARCH area | Status in this repo |
+|-----------|---------------------|
+| Gateway, broker, workers, delivery store | Implemented (Redis Streams + Postgres). |
+| Templates & preferences | CRUD + worker enforcement. |
+| Retries, DLQ, fallback, rate limit | Implemented (configurable `WORKER_MAX_TRIES`). |
+| Scheduler | DB-backed `scheduled_jobs` + worker poller. |
+| Metrics | Prometheus scrape on gateway and worker. |
+| Kafka/SQS, multi-region, full compliance UI | Out of scope for this reference implementation; interfaces allow swapping broker. |
+
+## Legacy spike
+
+The old JGit “forward merge email” experiment is documented only in [docs/legacy-forward-merge-spike.md](docs/legacy-forward-merge-spike.md).
+
+## Build
+
+```bash
+./gradlew build
+```
